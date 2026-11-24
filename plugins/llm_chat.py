@@ -15,6 +15,7 @@ from loguru import logger
 
 from core.bot import Bot, flag_config
 from core.protocol.events import C2CMessage, Event, GroupAtMessage
+from plugins import user_map
 from plugins.mcp_server import LLM_TOOLS, ensure_started
 
 Handler = Callable[..., Awaitable[None]]
@@ -63,6 +64,13 @@ REPLY_INTERVAL = 1.0
 MAX_CONTEXT_CHARS = 4000
 MAX_TOOL_RESULT_CHARS = 2000
 BRACKET_PATTERN = re.compile(r"[（(][^（()）]*[)）]")
+ROLE_ECHO_PREFIX = re.compile(r"^[\[【]([^\]】\r\n]{1,20})[\]】]\s*[:：]\s*")
+SPEAKER_DIRECTIVE = (
+    "【身份识别规则】\n"
+    "用户消息开头的 `[名称]: ` 仅用于标识当前发言人身份，不同名称代表不同成员，"
+    "请严格区分各发言人的话语与身份，切勿张冠李戴。\n"
+    "你在回复时请直接输出正文，绝对不要在回复开头模仿或添加 `[机器人名]: ` 等中括号署名。"
+)
 SUBCONSCIOUS_PLACEHOLDERS = {
     "空字符串",
     "空",
@@ -138,29 +146,58 @@ async def _chat(event: Event, bot: Bot) -> None:
     prompt = event.content.strip()
     if not prompt and not event.images:
         return
+    has_text = bool(prompt)
     if not prompt:
         prompt = "[图片]"
     if prompt.startswith(ECHO_PREFIX) or prompt == PING_COMMAND:
         return
     conv_id = _conv_id(event)
-    user_id = _user_id(event)
-    display_name = _user_name(event)
+    user_id = user_map.extract_user_id(event)
+    group_openid = user_map.extract_group_id(event)
+    member_nick = user_map.extract_member_nick(event)
+    mapping = await user_map.load_map(bot)
+    display_name = user_map.resolve_name(
+        mapping, user_id, group_openid=group_openid, member_nick=member_nick
+    )
     _ensure_gc(bot)
     if not await _should_reply(event, bot, prompt):
         logger.info("唤醒判断未通过，跳过回复 conv={}", conv_id)
+        if has_text:
+            user_map.spawn_extract(
+                event, bot, prompt, conv_id, user_id, _complete_intro
+            )
         _spawn_subconscious(event, bot, prompt, conv_id, user_id, display_name)
         return
     if not await _allow(bot, conv_id):
         logger.warning("触发频控, 静默跳过 conv={}", conv_id)
+        if has_text:
+            user_map.spawn_extract(
+                event, bot, prompt, conv_id, user_id, _complete_intro
+            )
         _spawn_subconscious(event, bot, prompt, conv_id, user_id, display_name)
         return
+    if has_text:
+        user_map.spawn_extract(
+            event, bot, prompt, conv_id, user_id, _complete_intro
+        )
     logger.info("收到 [{}] 消息: {}", event.type, prompt[:50])
     limit = _int_config(bot, "llm_context_limit", DEFAULT_CONTEXT_LIMIT)
     async with _HISTORY_LOCK:
         history = await _load(bot)
         turns = _messages_of(history.get(conv_id))
-    user_content = await _user_content(bot, prompt, event.images)
-    messages = _build_messages(bot, user_content, turns, limit)
+    custom_alias = user_map.custom_name(mapping, user_id, group_openid=group_openid)
+    use_speaker_tag = bool(group_openid or custom_alias)
+    effective_prompt = f"[{display_name}]: {prompt}" if use_speaker_tag else prompt
+    user_content = await _user_content(bot, effective_prompt, event.images)
+    messages = _build_messages(
+        bot,
+        user_content,
+        turns,
+        limit,
+        mapping=mapping,
+        group_openid=group_openid,
+        include_speaker_rule=use_speaker_tag,
+    )
     model = str(bot.config.get("llm_model") or DEFAULT_MODEL)
     logger.info("正在请求 LLM, model={}, 图片数={}", model, len(event.images))
     try:
@@ -178,11 +215,19 @@ async def _chat(event: Event, bot: Bot) -> None:
         )
         await bot.reply(event, FALLBACK)
         return
+    reply = _strip_role_echo(reply, bot)
     logger.info("LLM 回复成功: {}...", reply[:30])
     async with _HISTORY_LOCK:
         history = await _load(bot)
         turns = _messages_of(history.get(conv_id))
-        turns.append({"role": "user", "content": prompt})
+        user_turn: dict[str, Any] = {
+            "role": "user",
+            "user_id": user_id,
+            "content": prompt,
+        }
+        if member_nick:
+            user_turn["nick"] = member_nick
+        turns.append(user_turn)
         turns.append({"role": "assistant", "content": reply})
         history[conv_id] = {
             "last_active": time.time(),
@@ -190,6 +235,45 @@ async def _chat(event: Event, bot: Bot) -> None:
         }
         await _save(bot, history)
     await _send_reply(event, bot, reply)
+
+
+async def _complete_intro(
+    bot: Bot, messages: list[dict[str, Any]], max_tokens: int
+) -> str:
+    data = await _post_completion(
+        bot,
+        messages,
+        max_tokens=max_tokens,
+        temperature=0.1,
+        disable_thinking=True,
+    )
+    return _extract_text(data)
+
+
+def _strip_single_echo(text: str, known_tags: set[str]) -> str:
+    match = ROLE_ECHO_PREFIX.match(text)
+    if not match:
+        return text
+    tag = match.group(1).strip().lower()
+    if tag not in known_tags:
+        return text
+    stripped = text[match.end() :].strip()
+    return stripped or text
+
+
+def _strip_role_echo(reply: str, bot: Bot) -> str:
+    wake_raw = bot.config.get("llm_wake_keywords")
+    wake_items = (
+        {str(item).strip().lower() for item in wake_raw if str(item).strip()}
+        if isinstance(wake_raw, list)
+        else {item.lower() for item in DEFAULT_WAKE_KEYWORDS}
+    )
+    known_tags = wake_items | {"assistant", "ai", "bot", "机器人", "助手"}
+    if "|||" not in reply:
+        return _strip_single_echo(reply, known_tags)
+    parts = [_strip_single_echo(part.strip(), known_tags) for part in reply.split("|||")]
+    cleaned = [part for part in parts if part]
+    return " ||| ".join(cleaned) if cleaned else reply
 
 
 async def _complete(
@@ -215,13 +299,21 @@ async def _post_completion(
     max_tokens: int | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str = "auto",
+    temperature: float | None = None,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     api_key = str(bot.config.get("llm_api_key") or "")
     if not api_key:
         raise RuntimeError("config.toml 缺少 llm_api_key")
     base_url = str(bot.config.get("llm_base_url") or DEFAULT_BASE_URL).rstrip("/")
     timeout = _float_config(bot, "llm_timeout", DEFAULT_TIMEOUT)
-    payload = _payload(bot, messages, max_tokens)
+    payload = _payload(
+        bot,
+        messages,
+        max_tokens,
+        temperature=temperature,
+        disable_thinking=disable_thinking,
+    )
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
@@ -404,9 +496,8 @@ def _spawn_subconscious(
     if now - _SUB_CLOCK.get(conv_id, 0.0) < window:
         return
     _SUB_CLOCK[conv_id] = now
-    if not getattr(bot, "_sub_shutdown_registered", False):
+    if _cancel_subconscious not in bot.cleanups:
         bot.on_shutdown(_cancel_subconscious)
-        setattr(bot, "_sub_shutdown_registered", True)
     task = asyncio.create_task(
         _subconscious_memory(event, bot, prompt, conv_id, user_id, display_name)
     )
@@ -519,13 +610,21 @@ async def _send_reply(event: Event, bot: Bot, reply: str) -> None:
 
 
 def _payload(
-    bot: Bot, messages: list[dict[str, Any]], max_tokens: int | None = None
+    bot: Bot,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": str(bot.config.get("llm_model") or DEFAULT_MODEL),
         "messages": messages,
         "stream": False,
-        "temperature": _float_config(bot, "llm_temperature", DEFAULT_TEMPERATURE),
+        "temperature": (
+            temperature
+            if temperature is not None
+            else _float_config(bot, "llm_temperature", DEFAULT_TEMPERATURE)
+        ),
         "top_p": _float_config(bot, "llm_top_p", DEFAULT_TOP_P),
         "max_tokens": (
             max_tokens
@@ -534,30 +633,72 @@ def _payload(
         ),
     }
     thinking = str(bot.config.get("llm_thinking") or "").strip()
-    if thinking:
-        payload["thinking"] = {"type": thinking}
-    effort = str(bot.config.get("llm_reasoning_effort") or "").strip()
-    if effort:
-        payload["reasoning_effort"] = effort
-    if _flag_config(bot, "llm_json_mode"):
-        payload["response_format"] = {"type": "json_object"}
+    if disable_thinking:
+        if thinking:
+            payload["thinking"] = {"type": "disabled"}
+    else:
+        if thinking:
+            payload["thinking"] = {"type": thinking}
+        effort = str(bot.config.get("llm_reasoning_effort") or "").strip()
+        if effort:
+            payload["reasoning_effort"] = effort
+        if _flag_config(bot, "llm_json_mode"):
+            payload["response_format"] = {"type": "json_object"}
     if _flag_config(bot, "llm_logprobs"):
         payload["logprobs"] = True
     return payload
 
 
-def _chars_of(messages: list[dict[str, str]]) -> int:
+def _chars_of(messages: list[dict[str, Any]]) -> int:
     return sum(len(str(item.get("content") or "")) for item in messages)
 
 
+def _render_turn(
+    item: dict[str, Any], mapping: dict[str, Any] | None, group_openid: str
+) -> tuple[dict[str, str], bool]:
+    role = str(item.get("role") or "user")
+    content = str(item.get("content") or "")
+    if role != "user" or mapping is None:
+        return ({"role": role, "content": content}, False)
+    uid = str(item.get("user_id") or "").strip()
+    if not uid:
+        return ({"role": role, "content": content}, False)
+    nick = str(item.get("nick") or "").strip() or None
+    if group_openid:
+        name = user_map.resolve_name(
+            mapping, uid, group_openid=group_openid, member_nick=nick
+        )
+        return ({"role": role, "content": f"[{name}]: {content}"}, True)
+    alias = user_map.custom_name(mapping, uid, group_openid="")
+    if alias:
+        return ({"role": role, "content": f"[{alias}]: {content}"}, True)
+    return ({"role": role, "content": content}, False)
+
+
 def _build_messages(
-    bot: Bot, user_content: Any, turns: list[dict[str, str]], limit: int
+    bot: Bot,
+    user_content: Any,
+    turns: list[dict[str, Any]],
+    limit: int,
+    mapping: dict[str, Any] | None = None,
+    group_openid: str = "",
+    include_speaker_rule: bool = False,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
+    raw_selected = turns[-2 * limit :] if limit > 0 else []
+    selected: list[dict[str, str]] = []
+    any_tagged = False
+    for item in raw_selected:
+        if not isinstance(item, dict):
+            continue
+        rendered, tagged = _render_turn(item, mapping, group_openid)
+        selected.append(rendered)
+        any_tagged = any_tagged or tagged
     system = _system_prompt(bot)
+    if include_speaker_rule or any_tagged:
+        system = f"{system}\n\n{SPEAKER_DIRECTIVE}" if system else SPEAKER_DIRECTIVE
     if system:
         messages.append({"role": "system", "content": system})
-    selected = turns[-2 * limit :] if limit > 0 else []
     while selected and _chars_of(selected) > MAX_CONTEXT_CHARS:
         selected = selected[1:]
     messages.extend(selected)
@@ -669,12 +810,11 @@ def _conv_id(event: Event) -> str:
 
 
 def _user_id(event: Event) -> str:
-    return event.author.id or "unknown"
+    return user_map.extract_user_id(event)
 
 
 def _user_name(event: Event) -> str:
-    author_id = _user_id(event)
-    return author_id[-6:] if len(author_id) >= 6 else author_id
+    return user_map.fallback_label(_user_id(event))
 
 
 def _history_path(bot: Bot) -> Path:
@@ -683,7 +823,7 @@ def _history_path(bot: Bot) -> Path:
     return path if path.is_absolute() else PLUGIN_DIR.parent / path
 
 
-def _messages_of(entry: Any) -> list[dict[str, str]]:
+def _messages_of(entry: Any) -> list[dict[str, Any]]:
     if isinstance(entry, dict):
         messages = entry.get("messages")
         return messages if isinstance(messages, list) else []

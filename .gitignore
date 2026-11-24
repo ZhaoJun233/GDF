@@ -6,3 +6,4 @@ data/
 config.toml
 plugins/prompt_system.txt
 plugins/prompt_world.txt
+.pytest_cache/

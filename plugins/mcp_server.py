@@ -137,12 +137,12 @@ async def _tool_remember(
     }
 
 
-async def _tool_recall(user_id: str) -> dict[str, Any]:
+async def _tool_recall(user_id: str, name: str = "") -> dict[str, Any]:
     async with _LOCK:
         data = await _load()
         profile = _normalize(data.get(user_id))
     facts = sorted(profile["facts"], key=lambda item: item["time"], reverse=True)
-    return {"user_id": user_id, "name": profile["name"], "facts": facts}
+    return {"user_id": user_id, "name": name or profile["name"], "facts": facts}
 
 
 def _rpc_ok(request_id: Any, result: Any) -> dict[str, Any]:
@@ -179,7 +179,7 @@ async def _dispatch(method: str, params: dict[str, Any]) -> Any:
         if name == "remember":
             result = await _tool_remember(user_id, display_name, args)
         elif name == "recall":
-            result = await _tool_recall(user_id)
+            result = await _tool_recall(user_id, display_name)
         else:
             return _tool_error(f"未知工具: {name}")
         return {

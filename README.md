@@ -130,6 +130,21 @@ llm_eval_prompt = "你需要判断是否需要回复这句话。只输出 YES �
 
 私聊不受该开关影响，始终回复。`smart` 的判定请求不进历史、不占频控配额，失败按「不回复」处理。空白内容与 `echo ` / `ping` 命令式消息在判定前即被拦截。
 
+## 群聊用户身份识别
+
+群聊场景下按成员身份自动隔离称呼，防止上下文多人对话时认错人：
+
+```toml
+llm_users_map_path = "data/users_map.json"
+llm_auto_name_enabled = true
+llm_name_confidence_threshold = 0.8
+```
+
+- **名称解析优先级**：`data/users_map.json` 中该群的自定义备注 -> `event.member.nick`（若载荷提供） -> `用户_后6位`。
+- **映射文件结构**：按群隔离存储在 `groups.<group_openid>.<member_openid>`，私聊备注存储在 `users.<user_openid>`（同时兼容直接顶层平铺 `group_openid` 的手写格式）。文件支持手动编辑，保存后自动热加载生效，无需重启。
+- **动态署名渲染**：`data/history.json` 在群聊用户消息中持久化 `user_id`，每次构造上下文时按最新备注动态渲染为 `[显示名]: 正文`；旧版无 `user_id` 的历史条目保持向后兼容。
+- **后台自称抽取**：开启 `llm_auto_name_enabled` 后，命中自称关键词的消息会在后台异步抽取备注（仅当置信度达到阈值且通过合法性校验时入库），不阻塞主对话回复，并同步对齐 MCP 长期记忆与潜意识旁路中的用户称呼。
+
 ## 多模态图片识别
 
 `llm_vision_enabled = true` 时，消息中的图片会被下载并转成 Base64 Data URL 随正文一起发出。
@@ -184,6 +199,7 @@ curl -s -X POST http://127.0.0.1:8080/mcp \
 
 ```
 data/history.json           对话历史，按会话隔离，自动裁剪到最近 llm_context_limit 轮
+data/users_map.json         用户身份备注映射（按群隔离，支持手动编辑热更新与自动抽取）
 logs/info_YYYY-MM-DD.log    INFO 及以上，保留 7 天
 logs/error_YYYY-MM-DD.log   ERROR，保留 7 天
 ```
