@@ -140,8 +140,8 @@ llm_auto_name_enabled = true
 llm_name_confidence_threshold = 0.8
 ```
 
-- **名称解析优先级**：`data/users_map.json` 中该群的自定义备注 -> `event.member.nick`（若载荷提供） -> `用户_后6位`。
-- **映射文件结构**：按群隔离存储在 `groups.<group_openid>.<member_openid>`，私聊备注存储在 `users.<user_openid>`（同时兼容直接顶层平铺 `group_openid` 的手写格式）。文件支持手动编辑，保存后自动热加载生效，无需重启。
+- **名称解析优先级**：`data/users_map.json` 中该群的自定义备注 -> 合法且未与同群成员撞名的 `event.member.nick`（若载荷提供） -> `用户_后6位`。
+- **映射文件结构**：按群严格隔离存储在 `groups.<group_openid>.<member_openid>`，私聊备注存储在 `users.<user_openid>`（不跨群或从私聊向群内回退）。文件支持手动编辑，保存后自动热加载生效，无需重启；若文件编码（支持 UTF-8 及 UTF-8 BOM）或 JSON 语法损坏，将按空表降级运行并拒绝自动覆写损坏文件，防止人工配置丢失。
 - **动态署名渲染**：`data/history.json` 在群聊用户消息中持久化 `user_id`，每次构造上下文时按最新备注动态渲染为 `[显示名]: 正文`；旧版无 `user_id` 的历史条目保持向后兼容。
 - **后台自称抽取**：开启 `llm_auto_name_enabled` 后，命中自称关键词的消息会在后台异步抽取备注（仅当置信度达到阈值且通过合法性校验时入库），不阻塞主对话回复，并同步对齐 MCP 长期记忆与潜意识旁路中的用户称呼。
 
@@ -179,7 +179,7 @@ mcp_token = ""               # 非空时校验 Bearer
 
 - 服务端为原生 aiohttp + JSON-RPC 2.0，支持 `initialize` / `tools/list` / `tools/call`，未实现 SSE，标准 MCP 客户端（Claude Desktop 等）连不上。
 - 记忆存于 `data/long_term_memory.json`，结构为 `{user_id: {"name": "...", "facts": [...]}}`，按发言人隔离个人档案，每人最多保留最近 20 条事实，写入走 lock + tmp + replace。
-- `user_id` 与 `display_name` 由插件侧强制注入：`user_id` 为发言人 openid，`display_name` 取其末 6 位作为称呼。模型无法在 arguments 中伪造他人身份。
+- `user_id` 与 `display_name` 由插件侧强制注入：`user_id` 为发言人 openid，`display_name` 按当前会话解析出的显示名（自定义备注 / 群昵称 / 用户_后6位）同步注入。模型无法在 arguments 中伪造他人身份。
 - 主流程命中回忆倾向词（「记得」「我是谁」「我上次」等）时，会把 `tool_choice` 临时提为 `required` 迫使模型调用 `recall`；若模型不支持该值，自动降级回 `auto` 重试。
 - `recall` 结果回填给模型时会附带「请结合这些事实作答」的提示，避免模型拿到档案仍凭空作答。
 - `llm_chat` 在启用时把工具定义注入 `payload["tools"]`，收到 `tool_calls` 后回调本服务，结果以 `role="tool"` 塞回上下文再次请求，最多 3 轮。
