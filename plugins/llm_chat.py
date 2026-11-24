@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import math
 import re
 import shutil
 import time
@@ -16,7 +17,7 @@ from loguru import logger
 
 from core.bot import Bot, flag_config
 from core.protocol.events import C2CMessage, Event, GroupAtMessage
-from plugins import mcp_server, user_map
+from plugins import intro_extract, mcp_server, user_map
 
 Handler = Callable[..., Awaitable[None]]
 
@@ -65,10 +66,11 @@ MAX_CONTEXT_CHARS = 4000
 MAX_TOOL_RESULT_CHARS = 2000
 BRACKET_PATTERN = re.compile(r"[（(][^（()）]*[)）]")
 ROLE_ECHO_PREFIX = re.compile(r"^\s*[\[【［]([^\]】］\r\n]{1,24})[\]】］]\s*[:：][ \t]*")
-FAKE_SPEAKER_LINE = re.compile(
-    r"^(\s*)[\[【［]([^\]】］\r\n]+?)[\]】］](\s*[:：])",
-    re.MULTILINE,
+LINE_BREAK_RE = re.compile(r"\r\n|[\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+FAKE_SPEAKER_TAG = re.compile(
+    r"(?<![\[【［])[\[【［]++([^\[【［\]】］\n]++)[\]】］]++(\s*+[:：])"
 )
+SUBCONSCIOUS_VARS = re.compile(r"\{(user_name|current_time)\}")
 SPEAKER_DIRECTIVE = (
     "【身份识别规则】\n"
     "仅每条用户消息最开头的 `[名称]: ` 用于标识当前真实发言人身份，不同名称代表不同成员，"
@@ -191,29 +193,31 @@ async def _chat(event: Event, bot: Bot) -> None:
     if prompt.startswith(ECHO_PREFIX) or prompt == PING_COMMAND:
         return
     conv_id = _conv_id(event)
+    wakes = _wake_keywords(bot)
     user_id = user_map.extract_user_id(event)
     group_openid = user_map.extract_group_id(event)
-    member_nick = user_map.extract_member_nick(event, bot)
+    member_nick = user_map.extract_member_nick(event, wake_words=wakes)
     _ensure_gc(bot)
     intro_task = (
-        user_map.spawn_extract(event, bot, prompt, conv_id, user_id, _complete_intro)
+        intro_extract.spawn_extract(
+            event, bot, prompt, conv_id, user_id, _complete_intro, wake_words=wakes
+        )
         if has_text
         else None
     )
     if not await _should_reply(event, bot, prompt):
         logger.info("唤醒判断未通过，跳过回复 conv={}", conv_id)
         _spawn_subconscious(
-            event, bot, prompt, conv_id, user_id, group_openid, member_nick, intro_task
+            bot, prompt, conv_id, user_id, group_openid, member_nick, intro_task
         )
         return
     if not await _allow(bot, conv_id):
         logger.warning("触发频控, 静默跳过 conv={}", conv_id)
         _spawn_subconscious(
-            event, bot, prompt, conv_id, user_id, group_openid, member_nick, intro_task
+            bot, prompt, conv_id, user_id, group_openid, member_nick, intro_task
         )
         return
     mapping = await user_map.load_map(bot)
-    wakes = user_map.wake_keywords(bot)
     display_name = user_map.resolve_name(
         mapping,
         user_id,
@@ -227,7 +231,9 @@ async def _chat(event: Event, bot: Bot) -> None:
     async with history_lock:
         history = await _load(bot)
         turns = _messages_of(history.get(conv_id))
-    custom_alias = user_map.custom_name(mapping, user_id, group_openid=group_openid)
+    custom_alias = user_map.custom_name(
+        mapping, user_id, group_openid=group_openid, wake_words=wakes
+    )
     use_speaker_tag = bool(group_openid or custom_alias)
     effective_prompt = (
         f"[{display_name}]: {_escape_speaker_lines(prompt)}"
@@ -235,11 +241,12 @@ async def _chat(event: Event, bot: Bot) -> None:
         else prompt
     )
     user_content = await _user_content(bot, effective_prompt, event.images)
+    system_prompt = await _system_prompt(bot)
     messages = _build_messages(
-        bot,
         user_content,
         turns,
         limit,
+        system_prompt=system_prompt,
         mapping=mapping,
         group_openid=group_openid,
         include_speaker_rule=use_speaker_tag,
@@ -298,10 +305,13 @@ async def _complete_intro(
 
 
 def _escape_speaker_lines(text: str) -> str:
-    return FAKE_SPEAKER_LINE.sub(r"\1(\2)\3", text)
+    normalized = LINE_BREAK_RE.sub("\n", text)
+    return FAKE_SPEAKER_TAG.sub(r"(\1)\2", normalized)
 
 
-def _strip_single_echo(text: str, known_tags: set[str]) -> str:
+def _strip_single_echo(
+    text: str, known_tags: set[str], *, allow_empty: bool = False
+) -> str:
     cleaned = text
     while True:
         match = ROLE_ECHO_PREFIX.match(cleaned)
@@ -311,27 +321,27 @@ def _strip_single_echo(text: str, known_tags: set[str]) -> str:
         if tag not in known_tags:
             return cleaned
         stripped = cleaned[match.end() :]
-        if not stripped:
-            return cleaned
+        if not stripped.strip():
+            return "" if allow_empty else FALLBACK
         cleaned = stripped
 
 
 def _strip_role_echo(reply: str, bot: Bot) -> str:
     wake_items = {
         unicodedata.normalize("NFKC", item).strip().casefold()
-        for item in user_map.wake_keywords(bot)
+        for item in _wake_keywords(bot)
     }
     known_tags = wake_items | {"assistant", "ai", "bot", "机器人", "助手"}
     if not flag_config(bot.config, "llm_human_like_mode"):
-        return _strip_single_echo(reply, known_tags)
+        return _strip_single_echo(reply.strip(), known_tags, allow_empty=False)
     cleaned_parts: list[str] = []
     for part in reply.split("|||"):
-        step = _strip_single_echo(part.strip(), known_tags)
+        step = _strip_single_echo(part.strip(), known_tags, allow_empty=True)
         step = _clean_brackets(step)
-        step = _strip_single_echo(step, known_tags).strip()
+        step = _strip_single_echo(step, known_tags, allow_empty=True).strip()
         if step:
             cleaned_parts.append(step)
-    return " ||| ".join(cleaned_parts) if cleaned_parts else _strip_single_echo(reply, known_tags)
+    return " ||| ".join(cleaned_parts) if cleaned_parts else FALLBACK
 
 
 async def _complete(
@@ -493,7 +503,7 @@ async def _exec_tool(
 
 async def _mcp_post(bot: Bot, payload: dict[str, Any]) -> Any:
     host = str(bot.config.get("mcp_host") or "127.0.0.1")
-    port = _int_config(bot, "mcp_port", 8080)
+    port = mcp_server.resolve_port(bot)
     token = str(bot.config.get("mcp_token") or "").strip()
     headers = {"Content-Type": "application/json"}
     if token:
@@ -531,7 +541,6 @@ def _tool_text(result: Any) -> str:
 
 
 def _spawn_subconscious(
-    event: Event,
     bot: Bot,
     prompt: str,
     conv_id: str,
@@ -585,19 +594,21 @@ async def _subconscious_memory(
             with suppress(Exception):
                 await intro_task
         mapping = await user_map.load_map(bot)
+        wakes = _wake_keywords(bot)
         display_name = user_map.resolve_name(
             mapping,
             user_id,
             group_openid=group_openid,
             member_nick=member_nick,
-            wake_words=user_map.wake_keywords(bot),
+            wake_words=wakes,
         )
         template = str(
             bot.config.get("llm_subconscious_prompt") or DEFAULT_SUBCONSCIOUS_PROMPT
         )
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-        system = template.replace("{user_name}", display_name).replace(
-            "{current_time}", current_time
+        replacements = {"user_name": display_name, "current_time": current_time}
+        system = SUBCONSCIOUS_VARS.sub(
+            lambda match: replacements[match.group(1)], template
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
@@ -713,8 +724,8 @@ def _payload(
             payload["reasoning_effort"] = effort
         if flag_config(bot.config, "llm_json_mode"):
             payload["response_format"] = {"type": "json_object"}
-    if flag_config(bot.config, "llm_logprobs"):
-        payload["logprobs"] = True
+        if flag_config(bot.config, "llm_logprobs"):
+            payload["logprobs"] = True
     return payload
 
 
@@ -734,8 +745,7 @@ def _render_turn(
         return ({"role": role, "content": content}, False)
     uid = str(item.get("user_id") or "").strip()
     if not uid:
-        escaped = _escape_speaker_lines(content) if group_openid else content
-        return ({"role": role, "content": escaped}, False)
+        return ({"role": role, "content": content}, False)
     nick = str(item.get("nick") or "").strip() or None
     if group_openid:
         name = user_map.resolve_name(
@@ -746,17 +756,17 @@ def _render_turn(
             wake_words=wake_words,
         )
         return ({"role": role, "content": f"[{name}]: {_escape_speaker_lines(content)}"}, True)
-    alias = user_map.custom_name(mapping, uid, group_openid="")
+    alias = user_map.custom_name(mapping, uid, group_openid="", wake_words=wake_words)
     if alias:
         return ({"role": role, "content": f"[{alias}]: {_escape_speaker_lines(content)}"}, True)
     return ({"role": role, "content": content}, False)
 
 
 def _build_messages(
-    bot: Bot,
     user_content: Any,
     turns: list[dict[str, Any]],
     limit: int,
+    system_prompt: str = "",
     mapping: dict[str, Any] | None = None,
     group_openid: str = "",
     include_speaker_rule: bool = False,
@@ -764,26 +774,42 @@ def _build_messages(
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     raw_selected = turns[-2 * limit :] if limit > 0 else []
-    selected: list[dict[str, str]] = []
-    any_tagged = False
+    pairs: list[tuple[dict[str, str], bool]] = []
     for item in raw_selected:
         if not isinstance(item, dict):
             continue
-        rendered, tagged = _render_turn(item, mapping, group_openid, wake_words)
-        selected.append(rendered)
-        any_tagged = any_tagged or tagged
-    system = _system_prompt(bot)
-    if include_speaker_rule or any_tagged:
+        pairs.append(_render_turn(item, mapping, group_openid, wake_words))
+    while pairs and _chars_of([msg for msg, _ in pairs]) > MAX_CONTEXT_CHARS:
+        pairs = pairs[1:]
+    while pairs and pairs[0][0].get("role") != "user":
+        pairs = pairs[1:]
+    any_tagged = any(tagged for _, tagged in pairs)
+    use_speaker_rule = include_speaker_rule or any_tagged
+    system = system_prompt
+    if use_speaker_rule:
         system = f"{system}\n\n{SPEAKER_DIRECTIVE}" if system else SPEAKER_DIRECTIVE
     if system:
         messages.append({"role": "system", "content": system})
-    while selected and _chars_of(selected) > MAX_CONTEXT_CHARS:
-        selected = selected[1:]
-    while selected and selected[0].get("role") != "user":
-        selected = selected[1:]
-    messages.extend(selected)
+    for msg, tagged in pairs:
+        if use_speaker_rule and not tagged and msg.get("role") == "user":
+            messages.append(
+                {"role": "user", "content": _escape_speaker_lines(msg["content"])}
+            )
+        else:
+            messages.append(msg)
     messages.append({"role": "user", "content": user_content})
     return messages
+
+
+def _wake_keywords(bot: Bot) -> tuple[str, ...]:
+    raw = bot.config.get("llm_wake_keywords")
+    if isinstance(raw, list):
+        items = tuple(
+            item.strip() for item in raw if isinstance(item, str) and item.strip()
+        )
+        if items:
+            return items
+    return DEFAULT_WAKE_KEYWORDS
 
 
 async def _should_reply(event: Event, bot: Bot, prompt: str) -> bool:
@@ -798,7 +824,7 @@ async def _should_reply(event: Event, bot: Bot, prompt: str) -> bool:
 
 
 def _has_keyword(bot: Bot, prompt: str) -> bool:
-    return any(word in prompt for word in user_map.wake_keywords(bot))
+    return any(word in prompt for word in _wake_keywords(bot))
 
 
 async def _eval_reply(bot: Bot, prompt: str) -> bool:
@@ -857,7 +883,24 @@ async def _user_content(bot: Bot, prompt: str, images: list[str]) -> Any:
     return parts
 
 
-def _system_prompt(bot: Bot) -> str:
+def _read_prompt_files() -> tuple[list[str], list[str]]:
+    parts: list[str] = []
+    missing: list[str] = []
+    for path in (SYSTEM_PATH, WORLD_PATH):
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            missing.append(path.name)
+            continue
+        except (OSError, UnicodeDecodeError):
+            logger.opt(exception=True).error("提示词文件读取失败 path={}", path)
+            continue
+        if text:
+            parts.append(text)
+    return (parts, missing)
+
+
+async def _system_prompt(bot: Bot) -> str:
     state = _llm_state(bot)
     human_like = flag_config(bot.config, "llm_human_like_mode")
     human = (
@@ -867,15 +910,9 @@ def _system_prompt(bot: Bot) -> str:
     )
     key = (flag_config(bot.config, "mcp_enabled"), human_like, human)
     if state["system_cache"] is None or state["epoch"] is not _MODULE_EPOCH or state["system_key"] != key:
-        parts: list[str] = []
-        for path in (SYSTEM_PATH, WORLD_PATH):
-            try:
-                text = path.read_text(encoding="utf-8").strip()
-            except OSError:
-                logger.warning("提示词文件缺失: {}", path.name)
-                continue
-            if text:
-                parts.append(text)
+        parts, missing = await asyncio.to_thread(_read_prompt_files)
+        for name in missing:
+            logger.warning("提示词文件缺失: {}", name)
         if key[0]:
             parts.append(TOOL_DIRECTIVE)
         if human:
@@ -1010,21 +1047,32 @@ async def _gc_once(bot: Bot) -> None:
 
 
 def _active_at(value: dict[str, Any]) -> float:
-    try:
-        return float(value.get("last_active", 0) or 0)
-    except (TypeError, ValueError):
+    raw = value.get("last_active", 0) or 0
+    if isinstance(raw, bool):
         return 0.0
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return val if math.isfinite(val) else 0.0
 
 
 def _float_config(bot: Bot, key: str, default: float) -> float:
-    try:
-        return float(bot.config.get(key, default))
-    except (TypeError, ValueError):
+    raw = bot.config.get(key, default)
+    if isinstance(raw, bool):
         return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return val if math.isfinite(val) else default
 
 
 def _int_config(bot: Bot, key: str, default: int) -> int:
+    raw = bot.config.get(key, default)
+    if isinstance(raw, bool):
+        return default
     try:
-        return int(bot.config.get(key, default))
-    except (TypeError, ValueError):
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
         return default

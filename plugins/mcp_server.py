@@ -226,14 +226,17 @@ async def start(bot: Bot) -> bool:
     if _RUNNER is not None:
         return True
     host = str(bot.config.get("mcp_host") or DEFAULT_HOST)
-    port = _int_config(bot, "mcp_port", DEFAULT_PORT)
+    raw_port = _int_config(bot, "mcp_port", DEFAULT_PORT)
+    port = resolve_port(bot)
+    if raw_port != port:
+        logger.warning("mcp_port 越界 {}, 回退默认端口 {}", raw_port, port)
     app = web.Application()
     app.router.add_post(ENDPOINT, lambda request: _http_handler(bot, request))
     runner = web.AppRunner(app)
     await runner.setup()
     try:
         await web.TCPSite(runner, host, port).start()
-    except OSError:
+    except (OSError, OverflowError):
         logger.opt(exception=True).error(
             "MCP 服务启动失败 host={} port={}", host, port
         )
@@ -260,8 +263,16 @@ async def ensure_started(bot: Bot) -> bool:
     return await start(bot)
 
 
+def resolve_port(bot: Bot) -> int:
+    port = _int_config(bot, "mcp_port", DEFAULT_PORT)
+    return port if 1 <= port <= 65535 else DEFAULT_PORT
+
+
 def _int_config(bot: Bot, key: str, default: int) -> int:
+    raw = bot.config.get(key, default)
+    if isinstance(raw, bool):
+        return default
     try:
-        return int(bot.config.get(key, default))
-    except (TypeError, ValueError):
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
         return default
